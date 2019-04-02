@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,7 +49,25 @@ type NetConf struct {
 	MTU    int  `json:"mtu"`
 }
 
-func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Result) (*current.Interface, *current.Interface, error) {
+// K8sArgs is the valid CNI_ARGS used for Kubernetes
+type K8sArgs struct {
+	types.CommonArgs
+	IP                         net.IP
+	K8S_POD_NAME               types.UnmarshallableString
+	K8S_POD_NAMESPACE          types.UnmarshallableString
+	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString
+}
+
+func VethNameForWorkload(namespace, podname string) string {
+	// A SHA1 is always 20 bytes long, and so is sufficient for generating the
+	// veth name and mac addr.
+	h := sha1.New()
+	h.Write([]byte(fmt.Sprintf("%s.%s", namespace, podname)))
+	prefix := "gke" // looks like FELIX_INTERFACEPREFIX not working.
+	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:11])
+}
+
+func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Result, containerIntName string) (*current.Interface, *current.Interface, error) {
 	// The IPAM result will be something like IP=192.168.3.5/24, GW=192.168.3.1.
 	// What we want is really a point-to-point link but veth does not support IFF_POINTOPONT.
 	// Next best thing would be to let it ARP but set interface to 192.168.3.5/32 and
@@ -63,7 +83,7 @@ func setupContainerVeth(netns ns.NetNS, ifName string, mtu int, pr *current.Resu
 	containerInterface := &current.Interface{}
 
 	err := netns.Do(func(hostNS ns.NetNS) error {
-		hostVeth, contVeth0, err := ip.SetupVeth(ifName, mtu, hostNS)
+		hostVeth, contVeth0, err := ip.SetupVeth(ifName, mtu, hostNS, containerIntName)
 		if err != nil {
 			return err
 		}
@@ -192,6 +212,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to load netconf: %v", err)
 	}
 
+	containerConf := K8sArgs{}
+
+	if err := types.LoadArgs(args.Args, &containerConf); err != nil {
+		return err
+	}
+
 	// run the IPAM plugin and get back the config to apply
 	r, err := ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
 	if err != nil {
@@ -217,7 +243,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	hostInterface, containerInterface, err := setupContainerVeth(netns, args.IfName, conf.MTU, result)
+	containerIntName := VethNameForWorkload(string(containerConf.K8S_POD_NAMESPACE), string(containerConf.K8S_POD_NAME))
+	hostInterface, containerInterface, err := setupContainerVeth(netns, args.IfName, conf.MTU, result, containerIntName)
 	if err != nil {
 		return err
 	}
